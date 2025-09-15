@@ -1,4 +1,4 @@
-import os, math, json
+import os, math, json, time
 from pathlib import Path
 
 import numpy as np
@@ -10,15 +10,17 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-from sklearn.metrics import mean_absolute_error
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.ensemble import HistGradientBoostingRegressor
 
 st.set_page_config(page_title="Submarine BC & Drag Estimator", layout="wide")
 st.title("Submarine Inlet BC & Drag Estimator (Quick POC)")
-st.caption("Build: cloud-autotrain v1.0 (no local installs)")
+st.caption("Build: cloud-autotrain + metrics + diagnostics v1.5 (defaults to 3000 samples)")
 
+# ----------------- config -----------------
 MODELS_PATH = Path("models/surrogates.joblib")
-AUTO_TRAIN = os.environ.get("AUTO_TRAIN", "1") == "1"  # cloud auto-train on first run
+AUTO_TRAIN = os.environ.get("AUTO_TRAIN", "1") == "1"          # train online if model missing
+AUTO_TRAIN_SAMPLES = int(os.environ.get("AUTO_TRAIN_SAMPLES", "3000"))  # default 3000
 
 # ----------------- synthetic data generator -----------------
 def generate_synth(n=300, seed=42):
@@ -38,7 +40,7 @@ def generate_synth(n=300, seed=42):
         depth = float(rng.uniform(10.0, 300.0))
         slenderness = L/D
 
-        # BC heuristics
+        # BC heuristics (these act as "ground truth" for the POC)
         TI = 0.015 + 0.02*(1.0 - nose)*0.5 + 0.01*(1.0 - tail)*0.5 + 0.001*abs(AoA)
         TI = max(0.005, min(0.10, TI))
         Lt = 0.07 * L * (0.6 + 0.4*(1.0 - tail)) * (1.0 - 0.5*fin)
@@ -98,8 +100,8 @@ def ensure_model():
         return
     if not AUTO_TRAIN:
         return
-    with st.status("Training surrogate models online (first run only)...", state="running"):
-        df = generate_synth(n=300)
+    with st.status(f"Training surrogate models online on {AUTO_TRAIN_SAMPLES} synthetic samples… (first run only)", state="running"):
+        df = generate_synth(n=AUTO_TRAIN_SAMPLES)
         train_and_save(df, MODELS_PATH)
     st.success("Training complete. Model cached on server.")
 
@@ -179,7 +181,7 @@ if st.button("Predict"):
         Cmu = 0.09
         omega = (k**0.5) / ((Cmu**0.25)*Lt)
         Cd = float(cd_model.predict(X_df))
-        source = MODEL_SOURCE
+        source = "Model (gradient boosting)"
     else:
         U_mag, TI, Lt, k, omega, Cd = heuristics_predict(**params)
         source = "Heuristics (no trained model found)"
@@ -212,7 +214,7 @@ if st.session_state.has_pred:
 else:
     st.info("Click **Predict** to compute inlet BCs and Cd.")
 
-# -------------- Explain my BCs (offline only on cloud) --------------
+# -------------- Explain my BCs (offline bullets) --------------
 st.divider()
 st.subheader("Explain my BCs")
 if not st.session_state.get("has_pred", False):
@@ -231,6 +233,219 @@ else:
         ]
         st.markdown("\n".join(bullets))
 
+# -------------- Diagnostic health report (medical-check style) --------------
 st.divider()
-st.caption("Tip: set env var AUTO_TRAIN=0 if you later commit models/surrogates.joblib to the repo.")
+st.subheader("Diagnostic health report (expected range vs actual)")
+
+def _band_status(val, lo, hi):
+    if lo <= val <= hi:
+        return "OK", "✅"
+    # soft band: 10% outside
+    span = max(1e-12, hi - lo)
+    lo_soft, hi_soft = lo - 0.1*span, hi + 0.1*span
+    if lo_soft <= val <= hi_soft:
+        return "Slightly out", "⚠️"
+    return "Out of range", "❌"
+
+if not st.session_state.get("has_pred", False):
+    st.info("Run **Predict** to view diagnostics.")
+else:
+    p = st.session_state.params
+    L, D, U, AoA = p["L"], p["D"], p["U"], p["AoA"],
+
+    # expected bands derived from the same heuristics used to synthesize ground truth
+    U_exp = p["U"] * max(0.95, math.cos(math.radians(p["AoA"])))
+    U_lo, U_hi = 0.97*U_exp, 1.03*U_exp  # ±3%
+
+    TI_exp = 0.015 + 0.02*(1.0 - p["nose_c"])*0.5 + 0.01*(1.0 - p["tail_c"])*0.5 + 0.001*abs(p["AoA"])
+    TI_exp = max(0.005, min(0.10, TI_exp))
+    TI_lo, TI_hi = max(0.003, 0.6*TI_exp), min(0.12, 1.4*TI_exp)  # ±40%
+
+    Lt_exp = 0.07 * p["L"] * (0.6 + 0.4*(1.0 - p["tail_c"])) * (1.0 - 0.5*p["fin_ar"])
+    Lt_exp = max(0.01*p["D"], min(0.3*p["L"], Lt_exp))
+    Lt_lo, Lt_hi = max(0.01*p["D"], 0.65*Lt_exp), min(0.3*p["L"], 1.35*Lt_exp)  # ±35%
+
+    k_exp = 1.5*(U_exp*TI_exp)**2
+    k_lo, k_hi = 0.5*k_exp, 1.5*k_exp  # ±50%
+
+    Cmu = 0.09
+    omega_exp = (k_exp**0.5) / ((Cmu**0.25)*max(1e-9, Lt_exp))
+    omega_lo, omega_hi = 0.5*omega_exp, 1.5*omega_exp  # ±50%
+
+    Re = p["Re"]
+    slenderness = p["slenderness"]
+    if Re > 1e5:
+        cf = 0.075 / ((math.log10(Re) - 2.0)**2)
+    else:
+        cf = 0.01
+    cd_friction = cf * (2.0*slenderness)**-0.3
+    cd_form = 0.002 + 0.004*(1.0 - p["tail_c"]) + 0.002*(1.0 - p["nose_c"]) + 0.02*(p["AoA"]/10.0)**2 + 0.01*p["fin_ar"]
+    Cd_exp = max(0.0015, cd_friction + cd_form)
+    Cd_lo, Cd_hi = 0.8*Cd_exp, 1.2*Cd_exp  # ±20%
+
+    rows = [
+        {"Quantity": "U_mag (m/s)", "Normal (≈)": f"{U_lo:.3f} – {U_hi:.3f}", "Actual": f"{st.session_state.U_mag:.3f}", **dict(Status=_band_status(st.session_state.U_mag, U_lo, U_hi))},
+        {"Quantity": "TI (–)", "Normal (≈)": f"{TI_lo:.4f} – {TI_hi:.4f}", "Actual": f"{st.session_state.TI:.4f}", **dict(Status=_band_status(st.session_state.TI, TI_lo, TI_hi))},
+        {"Quantity": "Lt (m)", "Normal (≈)": f"{Lt_lo:.3f} – {Lt_hi:.3f}", "Actual": f"{st.session_state.Lt:.3f}", **dict(Status=_band_status(st.session_state.Lt, Lt_lo, Lt_hi))},
+        {"Quantity": "k (m²/s²)", "Normal (≈)": f"{k_lo:.6f} – {k_hi:.6f}", "Actual": f"{st.session_state.k:.6f}", **dict(Status=_band_status(st.session_state.k, k_lo, k_hi))},
+        {"Quantity": "ω (1/s)", "Normal (≈)": f"{omega_lo:.6f} – {omega_hi:.6f}", "Actual": f"{st.session_state.omega:.6f}", **dict(Status=_band_status(st.session_state.omega, omega_lo, omega_hi))},
+        {"Quantity": "Cd (–)", "Normal (≈)": f"{Cd_lo:.6f} – {Cd_hi:.6f}", "Actual": f"{st.session_state.Cd:.6f}", **dict(Status=_band_status(st.session_state.Cd, Cd_lo, Cd_hi))},
+    ]
+    # expand Status tuple into two columns
+    for r in rows:
+        st_verb, st_icon = r.pop("Status")
+        r["Status"] = st_verb
+        r[" "] = st_icon  # a small icon column
+
+    df_diag = pd.DataFrame(rows, columns=["Quantity", "Normal (≈)", "Actual", "Status", " "])
+    st.dataframe(df_diag, use_container_width=True)
+
+    # short narrative, like a lab report impression
+    issues = [r for r in rows if r["Status"] != "OK"]
+    if not issues:
+        st.success("Impression: All inlet BCs and Cd are within expected bounds for the current geometry and operating point. ✅")
+    else:
+        bullets = []
+        for r in issues:
+            what = r["Quantity"].split(" ")[0]
+            bullets.append(f"- {r[' ']} **{r['Quantity']}** is {r['Status'].lower()} vs expected band (**{r['Normal (≈)']}**).")
+        st.warning("Impression: some values need attention:\n\n" + "\n".join(bullets))
+        st.caption("Tip: longer tail taper ↓TI & form drag; high AoA ↑TI and Cd; larger fins ↑secondary flows → consider local refinement and smoother inlet.")
+
+# ======================= METRICS PANEL =======================
+st.divider()
+st.subheader("Model Metrics (Eval on synthetic holdout)")
+
+def mean_iou_tolerance(y_true, y_pred, rel_band=0.05, abs_floor=1e-9):
+    y_true = np.asarray(y_true); y_pred = np.asarray(y_pred)
+    band_t = np.maximum(rel_band*np.abs(y_true), abs_floor)
+    band_p = np.maximum(rel_band*np.abs(y_pred), abs_floor)
+    d = np.abs(y_true - y_pred)
+    inter = np.maximum(0.0, band_t + band_p - d)
+    union = band_t + band_p + d
+    return float(np.mean(inter / union))
+
+n_eval = st.slider("Evaluation set size", 100, 800, 300, 50)
+if st.button("Run metrics"):
+    with st.status("Generating evaluation set & computing metrics…", state="running"):
+        df_eval = generate_synth(n=n_eval, seed=123)
+
+        features = ["L","D","speed_U","Re","nose_shape_c","tail_taper_c","fin_area_ratio","AoA_deg","depth_m"]
+        df_eval["slenderness"] = df_eval["L"]/df_eval["D"]
+        X_eval = df_eval[features + ["slenderness"]]
+
+        y_true = {
+            "BC_U_mag": df_eval["BC_U_mag"].values,
+            "BC_TI": df_eval["BC_TI"].values,
+            "BC_Lt": df_eval["BC_Lt"].values,
+            "Cd": df_eval["Cd"].values,
+        }
+
+        t0 = time.perf_counter()
+        if bc_models is not None and cd_model is not None:
+            U_hat = bc_models["BC_U_mag"].predict(X_eval)
+            TI_hat = bc_models["BC_TI"].predict(X_eval)
+            Lt_hat = bc_models["BC_Lt"].predict(X_eval)
+            Cd_hat = cd_model.predict(X_eval)
+            src = "Model"
+        else:
+            preds = [heuristics_predict(df_eval["L"][i], df_eval["D"][i], df_eval["speed_U"][i],
+                                        df_eval["Re"][i], df_eval["nose_shape_c"][i], df_eval["tail_taper_c"][i],
+                                        df_eval["fin_area_ratio"][i], df_eval["AoA_deg"][i], df_eval["depth_m"][i])
+                     for i in range(len(df_eval))]
+            U_hat, TI_hat, Lt_hat, _, _, Cd_hat = map(np.array, zip(*preds))
+            src = "Heuristics"
+        t1 = time.perf_counter()
+        latency_ms = (t1 - t0) * 1000.0 / len(df_eval)
+
+        y_pred = {"BC_U_mag": U_hat, "BC_TI": TI_hat, "BC_Lt": Lt_hat, "Cd": Cd_hat}
+
+        def reg_metrics(y, yhat):
+            mae = mean_absolute_error(y, yhat)
+            rmse = math.sqrt(mean_squared_error(y, yhat))
+            mape = float(np.mean(np.abs((np.array(y) - np.array(yhat)) / (np.array(y) + 1e-12)))) * 100.0
+            r2 = r2_score(y, yhat)
+            iou = mean_iou_tolerance(y, yhat, rel_band=0.05)
+            return dict(MAE=mae, RMSE=rmse, MAPE_pct=mape, R2=r2, IoU_5pct=iou)
+
+        bc_summary = {k: reg_metrics(y_true[k], y_pred[k]) for k in ["BC_U_mag", "BC_TI", "BC_Lt"]}
+        cd_summary = reg_metrics(y_true["Cd"], y_pred["Cd"])
+
+        eff_cd = cd_summary["R2"] / max(latency_ms, 1e-6)
+        eff_bc = np.mean([bc_summary[k]["R2"] for k in bc_summary]) / max(latency_ms, 1e-6)
+
+        sizes = np.linspace(0.2, 1.0, 6)
+        lc_sizes, lc_mae = [], []
+        df_lc = generate_synth(n=300, seed=777)
+        df_lc["slenderness"] = df_lc["L"]/df_lc["D"]
+        X_lc = df_lc[features + ["slenderness"]]
+        y_lc = df_lc["Cd"]
+        for frac in sizes:
+            n_train = max(40, int(len(df_lc)*frac))
+            X_tr, X_te, y_tr, y_te = train_test_split(X_lc, y_lc, test_size=0.2, random_state=int(1000*frac))
+            pre = ColumnTransformer([("num", StandardScaler(), X_tr.columns.tolist())], remainder="drop")
+            model = Pipeline([("pre", pre), ("reg", HistGradientBoostingRegressor(max_depth=6, learning_rate=0.06, max_iter=400))])
+            model.fit(X_tr.iloc[:n_train], y_tr.iloc[:n_train])
+            mae = mean_absolute_error(y_te, model.predict(X_te))
+            lc_sizes.append(n_train); lc_mae.append(mae)
+
+        st.session_state.metrics = dict(
+            src=src, n_eval=n_eval, latency_ms=latency_ms,
+            bc_summary=bc_summary, cd_summary=cd_summary,
+            eff_cd=eff_cd, eff_bc=eff_bc,
+            lc_sizes=lc_sizes, lc_mae=lc_mae,
+            eval_table=pd.DataFrame({
+                "BC_U_mag_true": y_true["BC_U_mag"], "BC_U_mag_pred": y_pred["BC_U_mag"],
+                "BC_TI_true": y_true["BC_TI"], "BC_TI_pred": y_pred["BC_TI"],
+                "BC_Lt_true": y_true["BC_Lt"], "BC_Lt_pred": y_pred["BC_Lt"],
+                "Cd_true": y_true["Cd"], "Cd_pred": y_pred["Cd"],
+            })
+        )
+    st.success("Metrics computed.")
+
+m = st.session_state.get("metrics")
+if m:
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Eval samples", m["n_eval"])
+        st.metric("Avg latency (ms/sample)", f"{m['latency_ms']:.3f}")
+    with c2:
+        st.metric("Cd R²", f"{m['cd_summary']['R2']:.4f}")
+        st.metric("Cd IoU@5%", f"{m['cd_summary']['IoU_5pct']:.4f}")
+    with c3:
+        st.metric("Efficiency (Cd)", f"{m['eff_cd']:.3f}")
+        st.caption("Efficiency = R² / latency_ms")
+
+    st.markdown("### Regression Metrics — BCs")
+    st.dataframe(pd.DataFrame(m["bc_summary"]).T.style.format({
+        "MAE":"{:.5f}", "RMSE":"{:.5f}", "MAPE_pct":"{:.3f}", "R2":"{:.4f}", "IoU_5pct":"{:.4f}"
+    }))
+
+    st.markdown("### Regression Metrics — Cd")
+    st.dataframe(pd.DataFrame([m["cd_summary"]], index=["Cd"]).style.format({
+        "MAE":"{:.5f}", "RMSE":"{:.5f}", "MAPE_pct":"{:.3f}", "R2":"{:.4f}", "IoU_5pct":"{:.4f}"
+    }))
+
+    st.markdown("### Loss log / Learning curve (Cd MAE vs. train size)")
+    lc_df = pd.DataFrame({"Train size": m["lc_sizes"], "MAE": m["lc_mae"]})
+    st.line_chart(lc_df, x="Train size", y="MAE", height=240)
+
+    st.markdown("### Predictions vs. Truth (Cd)")
+    scatter_df = pd.DataFrame({"Truth": m["eval_table"]["Cd_true"], "Pred": m["eval_table"]["Cd_pred"]})
+    st.scatter_chart(scatter_df, x="Truth", y="Pred", height=300)
+    st.caption("Ideal = diagonal line; tighter clustering ⇒ better surrogate.")
+    st.download_button("Download eval predictions (CSV)", m["eval_table"].to_csv(index=False).encode("utf-8"),
+                       file_name="eval_predictions.csv", mime="text/csv")
+
+# -------------- Dataset generator (hand Fluidyn a CSV) --------------
+st.divider()
+st.subheader("Generate Synthetic Dataset (CSV)")
+rows = st.number_input("Rows", min_value=100, max_value=20000, value=3000, step=100)
+if st.button("Create & Download CSV"):
+    df_csv = generate_synth(n=int(rows), seed=42)
+    st.download_button("Download samples.csv", df_csv.to_csv(index=False).encode("utf-8"),
+                       file_name=f"samples_{rows}.csv", mime="text/csv")
+
+st.divider()
+st.caption("Tip: commit models/surrogates.joblib to skip first-run training. Set AUTO_TRAIN_SAMPLES to control cloud training size.")
 
