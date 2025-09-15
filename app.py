@@ -14,8 +14,8 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.ensemble import HistGradientBoostingRegressor
 
 st.set_page_config(page_title="Submarine BC & Drag Estimator", layout="wide")
-st.title("Submarine Inlet BC & Drag Estimator (Quick POC)")
-st.caption("Build: cloud-autotrain + metrics + diagnostics v1.5 (defaults to 3000 samples)")
+st.title("Submarine Inlet BC & Drag Estimator")
+st.caption("Appar Build: cloud-autotrain + metrics + diagnostics v1.5")
 
 # ----------------- config -----------------
 MODELS_PATH = Path("models/surrogates.joblib")
