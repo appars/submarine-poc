@@ -176,14 +176,7 @@ data/
 ---
 
 ## 📄 License
-
-MIT (feel free to change for your org). Add a `LICENSE` file if needed.
+Apparsamy perumal
 
 ---
 
-## 🙋 Support
-
-Open an issue or ping in Discussions if you want:
-- a **one-page PDF** cheat sheet for the demo,
-- a **batch trainer** for Fluidyn data,
-- or a **Dockerfile** for on-prem runs.
