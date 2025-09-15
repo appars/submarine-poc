@@ -325,7 +325,9 @@ def mean_iou_tolerance(y_true, y_pred, rel_band=0.05, abs_floor=1e-9):
     union = band_t + band_p + d
     return float(np.mean(inter / union))
 
-n_eval = st.slider("Evaluation set size", 100, 800, 300, 50)
+MAX_EVAL = int(os.environ.get("METRICS_EVAL_MAX", "3000"))
+DEF_EVAL = int(os.environ.get("METRICS_EVAL_DEFAULT", "3000"))
+n_eval = st.slider("Evaluation set size", 100, MAX_EVAL, DEF_EVAL, 100)
 if st.button("Run metrics"):
     with st.status("Generating evaluation set & computing metrics…", state="running"):
         df_eval = generate_synth(n=n_eval, seed=123)
