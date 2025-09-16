@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ----- optional VTK reader (no GUI deps) -----
+# Optional VTK reader (no GUI deps)
 try:
     import meshio
     HAS_MESHIO = True
@@ -14,29 +14,17 @@ except Exception:
 
 st.set_page_config(page_title="Consume & Benchmark", layout="wide")
 st.title("Consume & Benchmark: OpenFOAM results")
-st.caption(
-    "Upload baseline & warm-start artifacts (log.simpleFoam, logs/, VTK/) to compute speedup, "
-    "outer-iteration convergence, and visualize fields."
-)
+st.caption("Upload baseline & warm-start artifacts (log.simpleFoam, logs/, VTK/) to compute speedup and visualize fields.")
 
-# ==================== helpers ====================
-
-def _sanitize_fields(selection, available, fallback):
-    """Keep only fields that exist; ensure non-empty by falling back."""
-    avail = set(available)
-    cleaned = [f for f in (selection or []) if f in avail]
-    if not cleaned:
-        cleaned = [f for f in (fallback or []) if f in avail] or list(available)
-    return cleaned
-
-TIME_RE        = re.compile(r"^\s*Time\s*=\s*([0-9.eE+-]+)", re.M)   # outer SIMPLE iter
-EXEC_TIME_RE   = re.compile(r"ExecutionTime\s*=\s*([0-9.+-eE]+)\s*s")
-SOLVE_RE       = re.compile(
+# ---------------- Parsing helpers ----------------
+TIME_RE      = re.compile(r"^\s*Time\s*=\s*([0-9.eE+-]+)", re.M)  # OUTER iter tag
+EXEC_TIME_RE = re.compile(r"ExecutionTime\s*=\s*([0-9.+-eE]+)\s*s")
+SOLVE_RE     = re.compile(
     r"Solving for\s+([A-Za-z0-9_]+),\s*Initial residual\s*=\s*([0-9.eE+-]+),\s*Final residual\s*=\s*([0-9.eE+-]+).*?(?:No Iterations\s*=\s*(\d+))?"
 )
 
 def parse_log_simplefoam(text: str):
-    """Return exec_time and DataFrame: step(outer), field, init, final, nIters."""
+    """Return exec_time and DataFrame with columns: step(outer), field, init, final, nIters."""
     exec_times = [float(m.group(1)) for m in EXEC_TIME_RE.finditer(text)]
     exec_time = exec_times[-1] if exec_times else None
 
@@ -48,59 +36,29 @@ def parse_log_simplefoam(text: str):
             continue
         m = SOLVE_RE.search(line)
         if m and step >= 0:
-            rows.append((
-                step,
-                m.group(1),
-                float(m.group(2)),
-                float(m.group(3)),
-                int(m.group(4)) if m.group(4) else math.nan,
-            ))
+            fld   = m.group(1)
+            initr = float(m.group(2))
+            finr  = float(m.group(3))
+            nits  = int(m.group(4)) if m.group(4) else math.nan
+            rows.append((step, fld, initr, finr, nits))
     df = pd.DataFrame(rows, columns=["step", "field", "init", "final", "nIters"])
     return exec_time, df
 
-def convergence_iter(df: pd.DataFrame, fields, thresh: float):
-    """First OUTER step where ALL selected fields have final residual <= thresh."""
+def convergence_iter(df: pd.DataFrame, thresh: float):
+    """
+    First OUTER step where ALL standard fields present (Ux,Uy,Uz,p,k,omega) are <= thresh.
+    If none of those exist, use all available fields.
+    """
     if df.empty:
         return None
-    avail = set(df["field"].unique())
-    fields = [f for f in (fields or []) if f in avail]
-    if not fields:
-        return None
+    preferred = ["Ux","Uy","Uz","p","k","omega"]
+    avail = list(df["field"].unique())
+    fields = [f for f in preferred if f in avail] or avail
     g = df[df["field"].isin(fields)].groupby("step")["final"].max().sort_index()
     ok = np.where(g.values <= thresh)[0]
     return int(g.index[ok[0]]) if len(ok) else None
 
-def first_cross_table(df: pd.DataFrame, fields, thresh: float) -> pd.DataFrame:
-    """Per-field summary: first crossing, best residual, gap vs threshold."""
-    avail = set(df["field"].unique())
-    fields = [f for f in (fields or []) if f in avail] or sorted(avail)
-    rows = []
-    for f in fields:
-        sub = df[df["field"] == f]
-        if sub.empty:
-            rows.append((f, None, np.nan, np.nan)); continue
-        best = float(sub["final"].min())
-        meets = sub.loc[sub["final"] <= thresh, "step"]
-        first = int(meets.iloc[0]) if not meets.empty else None
-        gap = (best / thresh) if (thresh > 0 and np.isfinite(best)) else np.nan
-        rows.append((f, first, best, gap))
-
-    out = pd.DataFrame(rows, columns=["field", "first_iter", "best_final", "gap_vs_thresh"])
-    def fmt_iter(x): return "—" if (x is None or (isinstance(x, float) and np.isnan(x))) else f"{int(x)}"
-    def fmt_best(x): 
-        try: return f"{x:.2e}"
-        except: return "—"
-    def fmt_gap(g):
-        if g is None or (isinstance(g, float) and not np.isfinite(g)): return "—"
-        return (f"{1/max(g,1e-12):.1f}× under" if g <= 1 else f"{g:.1f}× over")
-    out_disp = pd.DataFrame({
-        "field": out["field"],
-        "First ≤ thr (outer)": out["first_iter"].map(fmt_iter),
-        "Best residual": out["best_final"].map(fmt_best),
-        "Gap vs thr": out["gap_vs_thresh"].map(fmt_gap),
-    })
-    return out_disp
-
+# --------------- ZIP ingestion ---------------
 def _latest_time_from_paths(paths):
     def extract_num(p):
         try:
@@ -114,9 +72,12 @@ def _latest_time_from_paths(paths):
     return extract_num(paths[-1])
 
 def load_zip_artifacts(upload) -> dict:
-    """Returns dict: {'exec_time', 'residuals', 'vtu'}."""
+    """
+    Returns: {"exec_time": float|None, "residuals": DataFrame, "vtu": list[(name, meshio.Mesh)]}
+    """
     zf = zipfile.ZipFile(upload)
 
+    # 1) Parse log.simpleFoam
     exec_time = None
     residuals = pd.DataFrame()
     for name in zf.namelist():
@@ -126,6 +87,7 @@ def load_zip_artifacts(upload) -> dict:
             exec_time, residuals = parse_log_simplefoam(text)
             break
 
+    # 2) Read VTU (latest time)
     meshes = []
     if HAS_MESHIO:
         vtu_members = [n for n in zf.namelist() if n.lower().endswith(".vtu")]
@@ -138,37 +100,39 @@ def load_zip_artifacts(upload) -> dict:
                         meshes.append((n, meshio.read(io.BytesIO(f.read()))))
                 except Exception:
                     pass
+
     return {"exec_time": exec_time, "residuals": residuals, "vtu": meshes}
 
-def plot_residuals(df: pd.DataFrame, title: str, plot_fields, thresh: float):
-    """Log-scale multi-curve plot; fully guarded against empty/unknown fields."""
+# --------------- Plotting ---------------
+def plot_residuals(df: pd.DataFrame, title: str, thresh: float):
+    """Log-scale curves for standard fields if present; otherwise plot all fields."""
     if df.empty:
-        st.warning(f"{title}: no residuals parsed."); return
-    avail = set(df["field"].unique())
-    plot_fields = [f for f in (plot_fields or []) if f in avail]
-    if not plot_fields:
-        st.info(f"{title}: none of the selected fields are present in the log."); return
+        st.warning(f"{title}: no residuals parsed.")
+        return
+
+    preferred = ["Ux","Uy","Uz","p","k","omega"]
+    avail = list(df["field"].unique())
+    plot_fields = [f for f in preferred if f in avail] or sorted(avail)
 
     piv = df[df["field"].isin(plot_fields)].pivot_table(
         index="step", columns="field", values="final", aggfunc="last"
     ).sort_index()
     long = piv.reset_index().melt("step", var_name="field", value_name="final").dropna()
     if long.empty:
-        st.info(f"{title}: no samples to plot for selected fields."); return
+        st.info(f"{title}: no samples to plot.")
+        return
 
     import plotly.express as px
-    fig = px.line(
-        long, x="step", y="final", color="field",
-        labels={"step": "Outer iteration (Time index)", "final": "Final residual"},
-        render_mode="webgl",
-    )
+    fig = px.line(long, x="step", y="final", color="field",
+                  labels={"step":"Outer iteration (Time index)", "final":"Final residual"},
+                  render_mode="webgl")
     fig.update_yaxes(type="log", tickformat=".1e")
     fig.add_hline(y=thresh, line_dash="dot", line_width=1)
     fig.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10))
     st.plotly_chart(fig, use_container_width=True)
 
 def field_slice_plot(meshes, field_name="U", component="mag", plane="Y", value=0.0, sample=6000):
-    """Simple 3D scatter slice from VTU."""
+    """Simple 3D scatter slice through the latest VTU set."""
     import plotly.express as px
     rng = np.random.default_rng(0)
     all_pts, all_vals = [], []
@@ -220,8 +184,7 @@ def field_slice_plot(meshes, field_name="U", component="mag", plane="Y", value=0
     fig = px.scatter_3d(df, x="x", y="y", z="z", color="val", opacity=0.65, height=520)
     st.plotly_chart(fig, use_container_width=True)
 
-# ==================== UI ====================
-
+# ---------------- UI ----------------
 st.subheader("1) Upload artifacts")
 c1, c2 = st.columns(2)
 with c1:
@@ -229,14 +192,14 @@ with c1:
 with c2:
     warm_zip = st.file_uploader("Warm-start ZIP (must contain log.simpleFoam; optional logs/ & VTK/)", type=["zip"], key="warm")
 
-thresh = st.number_input("Residual threshold for convergence", min_value=1e-8, max_value=1e-3,
+thresh = st.number_input("Residual threshold (dashed line on plots)", min_value=1e-8, max_value=1e-3,
                          value=1e-5, step=1e-6, format="%.0e")
 
 go = st.button("Compute metrics & visualize")
 if not go:
     st.stop()
 
-# ---- parse uploads ----
+# Parse uploads
 base = load_zip_artifacts(base_zip) if base_zip else None
 warm = load_zip_artifacts(warm_zip) if warm_zip else None
 if not base or base["residuals"].empty:
@@ -244,42 +207,16 @@ if not base or base["residuals"].empty:
 if not warm or warm["residuals"].empty:
     st.error("Warm-start residuals not found. Ensure your ZIP contains a valid log.simpleFoam."); st.stop()
 
-# ==================== Convergence & residuals ====================
+# ---------------- Residuals & metrics ----------------
 st.divider()
-st.subheader("2) Convergence & residuals")
+st.subheader("2) Convergence & residuals (log scale)")
 
-all_fields = sorted(set(base["residuals"]["field"].unique()) | set(warm["residuals"]["field"].unique()))
-default_fields = [f for f in ["Ux","Uy","Uz","p","k","omega"] if f in all_fields]
+plot_residuals(base["residuals"], "Baseline", thresh)
+b_iter = convergence_iter(base["residuals"], thresh)
 
-chosen_raw = st.multiselect(
-    "Fields that must be ≤ threshold to declare a run 'converged'",
-    options=all_fields,
-    default=default_fields or all_fields,
-)
-chosen = _sanitize_fields(chosen_raw, all_fields, default_fields)
+plot_residuals(warm["residuals"], "Warm-start", thresh)
+w_iter = convergence_iter(warm["residuals"], thresh)
 
-# plotting set (canonical order; sanitized)
-plot_pref = ["Ux","Uy","Uz","p","k","omega"]
-plot_fields = _sanitize_fields(plot_pref, all_fields, all_fields)
-
-# plots (no “did not meet” banners)
-plot_residuals(base["residuals"], "Baseline", plot_fields, thresh)
-b_iter = convergence_iter(base["residuals"], chosen, thresh)
-
-plot_residuals(warm["residuals"], "Warm-start", plot_fields, thresh)
-w_iter = convergence_iter(warm["residuals"], chosen, thresh)
-
-# per-field tables
-st.markdown("##### Per-field first crossing & gap")
-t1, t2 = st.columns(2)
-with t1:
-    st.caption("Baseline")
-    st.dataframe(first_cross_table(base["residuals"], chosen or all_fields, thresh), use_container_width=True)
-with t2:
-    st.caption("Warm-start")
-    st.dataframe(first_cross_table(warm["residuals"], chosen or all_fields, thresh), use_container_width=True)
-
-# headline metrics
 b_time, w_time = base["exec_time"], warm["exec_time"]
 m1, m2, m3, m4 = st.columns(4)
 with m1: st.metric("Baseline time (s)", f"{b_time:.3f}" if b_time else "n/a")
@@ -290,11 +227,9 @@ with m4: st.metric("Warm-start iters (outer)", w_iter if w_iter is not None else
 if b_time and w_time:
     st.success(f"**Speedup** = baseline / warm-start = **{b_time / max(w_time, 1e-9):.2f}×**")
 
-st.caption("Notes: Iteration index = SIMPLE outer step parsed from 'Time = ...'. "
-           "ExecutionTime is parsed from the final line of log.simpleFoam. "
-           "Threshold line helps visualize the chosen convergence target.")
+st.caption("Outer iteration index is parsed from 'Time = ...' in the log. The dashed line is your chosen residual threshold for reference.")
 
-# ==================== Cd comparison (optional) ====================
+# ---------------- Force/Cd comparison ----------------
 st.divider()
 st.subheader("3) Force/Cd comparison (optional)")
 d1, d2 = st.columns(2)
@@ -302,35 +237,35 @@ with d1:
     base_cd = st.file_uploader("Baseline forces/Cd CSV", type=["csv"], key="bcd")
 with d2:
     warm_cd = st.file_uploader("Warm-start forces/Cd CSV", type=["csv"], key="wcd")
+
 if base_cd and warm_cd:
     dfb = pd.read_csv(base_cd); dfw = pd.read_csv(warm_cd)
     def cd_col(df):
         for c in df.columns:
             lc = c.lower()
-            if lc in ("cd", "c_d") or "cd" in lc: return c
+            if lc in ("cd","c_d") or "cd" in lc: return c
         return df.columns[-1]
     cb, cw = cd_col(dfb), cd_col(dfw)
     st.line_chart(pd.DataFrame({"baseline_Cd": dfb[cb], "warm_Cd": dfw[cw]}), height=260)
     if len(dfb[cb])>0 and len(dfw[cw])>0:
         st.write(f"Baseline mean Cd: **{dfb[cb].mean():.6f}**, Warm-start mean Cd: **{dfw[cw].mean():.6f}**")
 
-# ==================== VTK visualization ====================
+# ---------------- VTK visualization ----------------
 st.divider()
 st.subheader("4) Field visualization from VTK (latest time)")
+
 if not HAS_MESHIO:
     st.info("VTK viewing requires meshio; add `meshio` and `plotly` to requirements.txt.")
 else:
-    field = st.selectbox("Field", ["U", "p", "k", "omega", "nut"], index=0)
-    comp  = st.selectbox("Component (vectors only)", ["mag", "x", "y", "z"], index=0)
-    plane = st.selectbox("Slice plane", ["Y", "X", "Z"], index=0)
+    field = st.selectbox("Field", ["U","p","k","omega","nut"], index=0)
+    comp  = st.selectbox("Component (vectors only)", ["mag","x","y","z"], index=0)
+    plane = st.selectbox("Slice plane", ["Y","X","Z"], index=0)
     val   = st.number_input(f"{plane}-plane value (approx)", value=0.0)
-    which = st.radio("Dataset", ["Warm-start", "Baseline"], index=0, horizontal=True)
+    which = st.radio("Dataset", ["Warm-start","Baseline"], index=0, horizontal=True)
+
     meshes = warm["vtu"] if which == "Warm-start" else base["vtu"]
     if not meshes:
         st.warning("No VTU found in the ZIP (did you run `foamToVTK -latestTime` before zipping?).")
     else:
         field_slice_plot(meshes, field_name=field, component=comp, plane=plane, value=val, sample=6000)
-
-st.caption("Tip: Use the multiselect above to define which fields constitute 'converged'. "
-           "Tables show first crossing and gap vs threshold for transparency.")
 
