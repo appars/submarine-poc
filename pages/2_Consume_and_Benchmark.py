@@ -101,15 +101,43 @@ def summarize_residuals(df: pd.DataFrame, title: str, thresh: float):
     if df.empty:
         st.warning(f"{title}: no residuals parsed.")
         return None
-    # pivot for plotting: iter x field -> final
-    piv = df.pivot_table(index="iter", columns="field", values="final", aggfunc="last")
-    st.line_chart(piv, height=280)
-    conv_at = convergence_iter(df, thresh=thresh)
+
+    # Keep common fields if present (order is nice for legend)
+    preferred = ["Ux", "Uy", "Uz", "p", "k", "omega"]
+    fields_present = [f for f in preferred if f in df["field"].unique()]
+    use_fields = fields_present if fields_present else sorted(df["field"].unique())
+
+    df_ = df[df["field"].isin(use_fields)].copy()
+    if df_.empty:
+        st.warning(f"{title}: residual table parsed, but none of the expected fields found.")
+        return None
+
+    # pivot -> long form for Plotly
+    piv = df_.pivot_table(index="iter", columns="field", values="final", aggfunc="last").sort_index()
+    long = piv.reset_index().melt("iter", var_name="field", value_name="final").dropna()
+
+    # Plot with log y-axis so small values are visible
+    import plotly.express as px
+    import plotly.graph_objects as go
+    fig = px.line(
+        long, x="iter", y="final", color="field",
+        labels={"iter": "Iteration", "final": "Final residual"},
+        render_mode="webgl",
+    )
+    fig.update_yaxes(type="log", tickformat=".1e")
+    fig.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10))
+    fig.add_hline(y=thresh, line_dash="dot", line_width=1)
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Convergence iteration
+    conv_at = convergence_iter(df_, fields=use_fields, thresh=thresh)
     if conv_at:
         st.success(f"{title}: convergence (all fields ≤ {thresh:g}) by iter **{conv_at}**.")
     else:
         st.info(f"{title}: did not meet threshold {thresh:g} within parsed iterations.")
     return conv_at
+
 
 def field_slice_plot(meshes, field_name="U", component="mag", plane="Y", value=0.0, sample=5000):
     """Scatter slice colored by magnitude/selected component."""
